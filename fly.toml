@@ -1,10 +1,10 @@
-# fly.toml app configuration file generated for ggdss-fastapi-backend on 2026-11-05T11:24:24Z
+# fly.toml app configuration file generated for ggdss-fastapi-backend on 2026-11-05T12:02:51Z
 #
 # See https://fly.io/docs/reference/configuration/ for information about how to use this file.
 #
 
 app = 'ggdss-fastapi-backend'
-primary_region = 'jnb'
+primary_region = 'sin'
 
 [build]
 [http_service]

@@ -8,7 +8,7 @@ class Settings(BaseSettings):
     JWT_SECRET: str = "change-me"
     JWT_ALGORITHM: str = "HS256"
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 720
-    CORS_ORIGINS: str = "http://localhost:5173"
+    CORS_ORIGINS: str = "https://arewatech.com"
 
     class Config:
         env_file = ".env"

@@ -23,7 +23,7 @@ from reportlab.platypus import (
 from ..database import db
 from ..dependencies import require_roles
 from ..helpers import oid, grade_for
-from .results import get_grading, _build_class_results
+from .results import get_grading
 
 router = APIRouter(prefix="/report-cards", tags=["report-cards"])
 ALLOWED = ("super_admin", "school_admin", "teacher")
@@ -100,37 +100,46 @@ async def _build_card(
     offered = passed + failed
     average = round(total / offered, 2) if offered else 0
 
-    # ---- Position & Class Size ----
+    # ---- Position & Class Size Calculation ----
     pos = None
-    class_size = None
-    
-    # 1. Get Class Size directly from students collection
-    try:
-        class_size = await db.students.count_documents({
-            "class_id": oid(class_id),
-            "status": "active"
-        })
-    except Exception as exc:
-        if os.environ.get("REPORT_CARD_DEBUG"):
-            print(f"[_build_card] class size count error: {exc}", file=sys.stderr)
+    class_size = 0
 
-    # 2. Get Position via _build_class_results
     try:
-        class_rows = await _build_class_results(
-            session_id, 
-            class_id, 
-            include_unapproved=False
-        )
-        pos = next(
-            (r["position"] for r in class_rows if r["student_id"] == student_id),
-            None,
-        )
-        # Fallback if count_documents failed
-        if class_size is None:
-            class_size = len(class_rows)
+        # 1. Get all published results for the ENTIRE class (not just this student)
+        all_results = await db.subject_results.find({
+            "session_id": oid(session_id),
+            "class_id": oid(class_id),
+            "status": "published",
+        }).to_list(10000)
+
+        # 2. Group by student_id and calculate total scores
+        student_totals = {}
+        for r in all_results:
+            s_id = str(r["student_id"])
+            if s_id not in student_totals:
+                student_totals[s_id] = 0
+            
+            # Sum only if all components exist
+            if None not in (r.get("assignment"), r.get("first_ca"), r.get("second_ca"), r.get("exam")):
+                student_totals[s_id] += (
+                    r["assignment"] + r["first_ca"] + r["second_ca"] + r["exam"]
+                )
+
+        # 3. Sort students by total score descending
+        sorted_totals = sorted(student_totals.items(), key=lambda x: x[1], reverse=True)
+        
+        # 4. Get the class size (number of students with results)
+        class_size = len(sorted_totals)
+
+        # 5. Find this student's position
+        for index, (s_id, _) in enumerate(sorted_totals):
+            if s_id == student_id:
+                pos = index + 1
+                break
+
     except Exception as exc:
         if os.environ.get("REPORT_CARD_DEBUG"):
-            print(f"[_build_card] position error: {exc}", file=sys.stderr)
+            print(f"[_build_card] manual position error: {exc}", file=sys.stderr)
 
     return {
         "student": {

@@ -436,7 +436,7 @@ def _render_card_pdf(data: dict):
                        kind="proportional")
 
     school_details = [
-        Paragraph("GOVERNMENT GIRLS DAY SECONDARY SCHOOL", school_title),
+        Paragraph("GOVERNMENT GIRLS DAY SECONDARY SCHOOL T/Wada", school_title),
         Paragraph("Tudun Wada, Birnin Kebbi, Kebbi State, Nigeria",
                   school_address),
         Spacer(1, 3),

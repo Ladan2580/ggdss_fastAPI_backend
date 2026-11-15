@@ -101,23 +101,36 @@ async def _build_card(
     average = round(total / offered, 2) if offered else 0
 
     # ---- Position & Class Size ----
-    # class_id alone is enough to get the students in this class
     pos = None
     class_size = None
+    
+    # 1. Get Class Size directly from students collection
+    try:
+        class_size = await db.students.count_documents({
+            "class_id": oid(class_id),
+            "status": "active"
+        })
+    except Exception as exc:
+        if os.environ.get("REPORT_CARD_DEBUG"):
+            print(f"[_build_card] class size count error: {exc}", file=sys.stderr)
+
+    # 2. Get Position via _build_class_results
     try:
         class_rows = await _build_class_results(
             session_id, 
             class_id, 
             include_unapproved=False
         )
-        class_size = len(class_rows)
         pos = next(
             (r["position"] for r in class_rows if r["student_id"] == student_id),
             None,
         )
+        # Fallback if count_documents failed
+        if class_size is None:
+            class_size = len(class_rows)
     except Exception as exc:
         if os.environ.get("REPORT_CARD_DEBUG"):
-            print(f"[_build_card] class results error: {exc}", file=sys.stderr)
+            print(f"[_build_card] position error: {exc}", file=sys.stderr)
 
     return {
         "student": {
@@ -307,7 +320,7 @@ def _render_card_pdf(data: dict):
     # ---------------- student info ----------------
     student = data["student"]
     date_label = safe(_resolve_date())
-    class_label = safe(_class_label())      # e.g. "JSS1A"
+    class_label = safe(_class_label())
 
     def info_cell(label, value):
         return Paragraph(
@@ -386,7 +399,7 @@ def _render_card_pdf(data: dict):
     summary_items = [
         ("TOTAL SCORE", summary.get("total_score", "—")),
         ("AVERAGE",     summary.get("average", "—")),
-        # ("POSITION",    summary.get("position") or "—"),
+        ("POSITION",    summary.get("position") or "—"),
         ("CLASS SIZE",  summary.get("class_size") or "—"),
         ("PASSED",      summary.get("passed", 0)),
         ("FAILED",      summary.get("failed", 0)),

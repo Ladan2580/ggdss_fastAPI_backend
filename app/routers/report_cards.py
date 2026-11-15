@@ -30,55 +30,12 @@ ALLOWED = ("super_admin", "school_admin", "teacher")
 
 
 # ============================================================
-# HELPERS
-# ============================================================
-def _coerce_objectid(value):
-    """Return a bson.ObjectId from various shapes, else None."""
-    if value is None:
-        return None
-    try:
-        from bson import ObjectId
-    except ImportError:
-        return None
-    if isinstance(value, ObjectId):
-        return value
-    if isinstance(value, dict):
-        if "$oid" in value:
-            try:
-                return ObjectId(str(value["$oid"]))
-            except Exception:
-                return None
-        if "_id" in value:
-            return _coerce_objectid(value["_id"])
-        return None
-    if isinstance(value, str):
-        s = value.strip()
-        if len(s) == 24:
-            try:
-                return ObjectId(s)
-            except Exception:
-                return None
-    return None
-
-
-def _extract_arm_ref(doc: dict):
-    """Return the first plausible arm reference found in a document."""
-    if not isinstance(doc, dict):
-        return None
-    for key in ("arm_id", "arm", "arms", "arm_object_id", "armId"):
-        if doc.get(key) is not None:
-            return doc.get(key)
-    return None
-
-
-# ============================================================
 # DATA BUILDING
 # ============================================================
 async def _build_card(
     session_id: str,
     class_id: str,
     student_id: str,
-    arm_id: str | None = None,
 ):
     student = await db.students.find_one({"_id": oid(student_id)})
     if not student:
@@ -89,18 +46,8 @@ async def _build_card(
         raise HTTPException(status_code=404, detail="Session not found")
 
     cls = await db.classes.find_one({"_id": oid(class_id)})
-
-    # ---- Resolve arm: query param wins, else pull from student doc ----
-    effective_arm_ref = arm_id or _extract_arm_ref(student)
-    effective_arm_oid = _coerce_objectid(effective_arm_ref)
-    arm = await db.arms.find_one({"_id": effective_arm_oid}) if effective_arm_oid else None
-
-    if os.environ.get("REPORT_CARD_DEBUG"):
-        print(
-            f"[_build_card] student_arm_ref={effective_arm_ref!r} "
-            f"arm_oid={effective_arm_oid!r} arm_doc={arm!r}",
-            file=sys.stderr,
-        )
+    if not cls:
+        raise HTTPException(status_code=404, detail="Class not found")
 
     rules = await get_grading()
     flt = {
@@ -153,22 +100,24 @@ async def _build_card(
     offered = passed + failed
     average = round(total / offered, 2) if offered else 0
 
+    # ---- Position & Class Size ----
+    # class_id alone is enough to get the students in this class
+    pos = None
+    class_size = None
     try:
         class_rows = await _build_class_results(
-            session_id, class_id, arm_id, include_unapproved=False
+            session_id, 
+            class_id, 
+            include_unapproved=False
         )
+        class_size = len(class_rows)
         pos = next(
             (r["position"] for r in class_rows if r["student_id"] == student_id),
             None,
         )
-    except Exception:
-        pos = None
-
-    # Build arm payload — never lose it, even if lookup failed
-    arm_out = {
-        "arm_id": str(effective_arm_oid) if effective_arm_oid else None,
-        "arm_name": (arm["name"] if arm and arm.get("name") else None),
-    }
+    except Exception as exc:
+        if os.environ.get("REPORT_CARD_DEBUG"):
+            print(f"[_build_card] class results error: {exc}", file=sys.stderr)
 
     return {
         "student": {
@@ -176,21 +125,16 @@ async def _build_card(
             "full_name": student.get("full_name"),
             "admission_no": student.get("admission_no"),
             "gender": student.get("gender"),
-            "arm_id": arm_out["arm_id"],
-            "arm_name": arm_out["arm_name"],
-            # keep raw ref too, in case the renderer wants to re-resolve
-            "arm_ref": str(effective_arm_oid) if effective_arm_oid else None,
         },
         "session_name": session["name"],
         "term": session["term"],
-        "class_name": cls["name"] if cls else "",
-        "arm_id": arm_out["arm_id"],
-        "arm_name": arm_out["arm_name"],
+        "class_name": cls["name"],  # exactly as saved in DB (e.g. "JSS1A")
         "subjects": subjects_out,
         "summary": {
             "total_score": total,
             "average": average,
             "position": pos,
+            "class_size": class_size,
             "passed": passed,
             "failed": failed,
         },
@@ -208,10 +152,9 @@ async def get_report_card(
     session_id: str,
     class_id: str,
     student_id: str,
-    arm_id: str | None = None,
     _=Depends(require_roles(*ALLOWED)),
 ):
-    return await _build_card(session_id, class_id, student_id, arm_id)
+    return await _build_card(session_id, class_id, student_id)
 
 
 @router.get("/pdf")
@@ -219,10 +162,9 @@ async def get_report_card_pdf(
     session_id: str,
     class_id: str,
     student_id: str,
-    arm_id: str | None = None,
     _=Depends(require_roles(*ALLOWED)),
 ):
-    data = await _build_card(session_id, class_id, student_id, arm_id)
+    data = await _build_card(session_id, class_id, student_id)
     return _render_card_pdf(data)
 
 
@@ -230,7 +172,7 @@ async def get_report_card_pdf(
 # PDF RENDERER
 # ============================================================
 def _render_card_pdf(data: dict):
-    """Render a student report card as a PDF; class label includes arm (JSS1A)."""
+    """Render a student report card as a PDF."""
 
     # ---------------- palette ----------------
     INK       = colors.HexColor("#2E3A34")
@@ -246,27 +188,13 @@ def _render_card_pdf(data: dict):
 
     # ---------------- auto-remark ----------------
     _REMARK_BANDS = [
-        (90, 100,
-         "An outstanding performance. Keep up the excellent work.",
-         "Excellent result. You are a credit to the school — sustain this standard."),
-        (80, 89.99,
-         "A very good result. Aim even higher next term.",
-         "Very good performance. With a little more effort you can reach the top."),
-        (70, 79.99,
-         "A good result. There is clear room for improvement.",
-         "Good performance. Stay focused and your grades will rise further."),
-        (60, 69.99,
-         "A fair result. More consistency at home and in class is needed.",
-         "Fair performance. Greater discipline and study habits will yield better results."),
-        (50, 59.99,
-         "A pass, but effort must improve significantly next term.",
-         "You have passed, but much more commitment is expected. Work harder."),
-        (40, 49.99,
-         "Below average. Serious improvement is required.",
-         "Unsatisfactory. You must take your studies far more seriously."),
-        (0, 39.99,
-         "A weak result. Immediate and sustained effort is essential.",
-         "Poor performance. This is unacceptable — a complete change of attitude is required."),
+        (90, 100, "An outstanding performance. Keep up the excellent work.", "Excellent result. You are a credit to the school — sustain this standard."),
+        (80, 89.99, "A very good result. Aim even higher next term.", "Very good performance. With a little more effort you can reach the top."),
+        (70, 79.99, "A good result. There is clear room for improvement.", "Good performance. Stay focused and your grades will rise further."),
+        (60, 69.99, "A fair result. More consistency at home and in class is needed.", "Fair performance. Greater discipline and study habits will yield better results."),
+        (50, 59.99, "A pass, but effort must improve significantly next term.", "You have passed, but much more commitment is expected. Work harder."),
+        (40, 49.99, "Below average. Serious improvement is required.", "Unsatisfactory. You must take your studies far more seriously."),
+        (0, 39.99, "A weak result. Immediate and sustained effort is essential.", "Poor performance. This is unacceptable — a complete change of attitude is required."),
     ]
 
     def _auto_remark(average, role: str = "teacher") -> str:
@@ -279,70 +207,11 @@ def _render_card_pdf(data: dict):
                 return teacher_r if role == "teacher" else principal_r
         return ""
 
-    # ---------------- arm resolution ----------------
-    def _resolve_arm_name() -> str:
-        """Get the arm name ('A', 'B', ...) from data, student, or db."""
-        student = data.get("student") or {}
-
-        # 1) Explicit names
-        for v in (
-            data.get("arm_name"),
-            student.get("arm_name") if isinstance(student, dict) else None,
-        ):
-            if isinstance(v, str) and v.strip():
-                return v.strip().upper()
-
-        # 2) Any ObjectId-shaped reference
-        candidates = [
-            data.get("arm_id"),
-            data.get("arm_ref"),
-            student.get("arm_id") if isinstance(student, dict) else None,
-            student.get("arm_ref") if isinstance(student, dict) else None,
-        ]
-        for c in candidates:
-            arm_oid = _coerce_objectid(c)
-            if arm_oid is not None:
-                try:
-                    doc = db["arms"].find_one({"_id": arm_oid})
-                    if doc and doc.get("name"):
-                        return str(doc["name"]).strip().upper()
-                except Exception as exc:
-                    if os.environ.get("REPORT_CARD_DEBUG"):
-                        print(f"[report_card] arms query error: {exc}", file=sys.stderr)
-
-        # 3) Re-fetch student directly from Mongo (last resort)
-        if isinstance(student, dict) and student.get("id"):
-            try:
-                from bson import ObjectId
-                fresh = db["students"].find_one({"_id": ObjectId(student["id"])})
-                if fresh:
-                    ref = _extract_arm_ref(fresh)
-                    arm_oid = _coerce_objectid(ref)
-                    if arm_oid is not None:
-                        doc = db["arms"].find_one({"_id": arm_oid})
-                        if doc and doc.get("name"):
-                            return str(doc["name"]).strip().upper()
-                    if fresh.get("arm_name"):
-                        return str(fresh["arm_name"]).strip().upper()
-            except Exception as exc:
-                if os.environ.get("REPORT_CARD_DEBUG"):
-                    print(f"[report_card] student re-fetch error: {exc}", file=sys.stderr)
-
-        return ""
-
-    def _class_with_arm() -> str:
-        """'JSS1' + 'A' → 'JSS1A'."""
-        cls = str(data.get("class_name", "")).replace(" ", "").upper()
-        arm = _resolve_arm_name()
-
-        if os.environ.get("REPORT_CARD_DEBUG"):
-            print(f"[report_card] class_name={cls!r} arm_name={arm!r}", file=sys.stderr)
-
-        if not arm:
-            return cls or "—"
-        if len(arm) <= 2 and arm.isalpha():
-            return f"{cls}{arm}" if cls else arm
-        return arm if not cls else f"{cls} {arm}"
+    # ---------------- class label (exactly as in DB) ----------------
+    def _class_label() -> str:
+        """Return the class name exactly as saved in the database."""
+        label = str(data.get("class_name", "")).strip().upper()
+        return label or "—"
 
     def _resolve_date() -> str:
         supplied = data.get("date")
@@ -366,51 +235,27 @@ def _render_card_pdf(data: dict):
 
     # ---------------- styles ----------------
     def style(name, **kw):
-        base = dict(
-            fontName="Helvetica",
-            fontSize=9,
-            leading=12,
-            textColor=INK,
-            alignment=0,
-        )
+        base = dict(fontName="Helvetica", fontSize=9, leading=12, textColor=INK, alignment=0)
         base.update(kw)
         return ParagraphStyle(name, **base)
 
-    school_title   = style("SchoolTitle", fontName="Helvetica-Bold",
-                           fontSize=15, leading=18, textColor=SAGE_DEEP,
-                           alignment=TA_CENTER, charSpace=1)
-    school_address = style("SchoolAddress", fontSize=9, leading=11,
-                           textColor=MUTED, alignment=TA_CENTER)
-    motto_style    = style("Motto", fontName="Helvetica-Oblique",
-                           fontSize=9.5, leading=12, textColor=SAGE_DEEP,
-                           alignment=TA_CENTER)
-    card_title     = style("CardTitle", fontName="Helvetica-Bold",
-                           fontSize=14, leading=17, textColor=SAGE_DEEP,
-                           alignment=TA_CENTER, charSpace=2.5)
-    section_style  = style("Section", fontName="Helvetica-Bold",
-                           fontSize=9, leading=12, textColor=SAGE_DEEP,
-                           charSpace=1)
+    school_title   = style("SchoolTitle", fontName="Helvetica-Bold", fontSize=15, leading=18, textColor=SAGE_DEEP, alignment=TA_CENTER, charSpace=1)
+    school_address = style("SchoolAddress", fontSize=9, leading=11, textColor=MUTED, alignment=TA_CENTER)
+    motto_style    = style("Motto", fontName="Helvetica-Oblique", fontSize=9.5, leading=12, textColor=SAGE_DEEP, alignment=TA_CENTER)
+    card_title     = style("CardTitle", fontName="Helvetica-Bold", fontSize=14, leading=17, textColor=SAGE_DEEP, alignment=TA_CENTER, charSpace=2.5)
+    section_style  = style("Section", fontName="Helvetica-Bold", fontSize=9, leading=12, textColor=SAGE_DEEP, charSpace=1)
     info_value     = style("InfoValue", fontSize=10, leading=13)
-    table_header   = style("TableHeader", fontName="Helvetica-Bold",
-                           fontSize=8, leading=10, textColor=SAGE_DEEP,
-                           alignment=TA_CENTER)
+    table_header   = style("TableHeader", fontName="Helvetica-Bold", fontSize=8, leading=10, textColor=SAGE_DEEP, alignment=TA_CENTER)
     table_body     = style("TableBody", fontSize=9, leading=11)
-    table_center   = style("TableCenter", fontSize=9, leading=11,
-                           alignment=TA_CENTER)
-    remark_text    = style("RemarkText", fontName="Helvetica-Oblique",
-                           fontSize=9.5, leading=12)
-    signature      = style("Signature", fontName="Helvetica-Bold",
-                           fontSize=9, leading=11, textColor=MUTED,
-                           alignment=TA_CENTER, charSpace=1)
-    footer_style   = style("Footer", fontName="Helvetica-Bold",
-                           fontSize=9, leading=11, textColor=MUTED,
-                           alignment=TA_CENTER, charSpace=2.5)
+    table_center   = style("TableCenter", fontSize=9, leading=11, alignment=TA_CENTER)
+    remark_text    = style("RemarkText", fontName="Helvetica-Oblique", fontSize=9.5, leading=12)
+    signature      = style("Signature", fontName="Helvetica-Bold", fontSize=9, leading=11, textColor=MUTED, alignment=TA_CENTER, charSpace=1)
+    footer_style   = style("Footer", fontName="Helvetica-Bold", fontSize=9, leading=11, textColor=MUTED, alignment=TA_CENTER, charSpace=2.5)
 
     def safe(value):
         return escape(str(value)) if value not in (None, "") else "—"
 
-    def panel(flowables, width=18, bg=WHITE, border=SAGE,
-              pad_top=7, pad_bottom=7, pad_lr=10, spine=None):
+    def panel(flowables, width=18, bg=WHITE, border=SAGE, pad_top=7, pad_bottom=7, pad_lr=10, spine=None):
         t = Table([[flowables]], colWidths=[width * cm])
         rules = [
             ("BACKGROUND", (0, 0), (-1, -1), bg),
@@ -427,21 +272,16 @@ def _render_card_pdf(data: dict):
         return t
 
     # ---------------- header ----------------
-    logo_path = (
-        Path(__file__).resolve().parent.parent / "assets" / "school_logo.jpeg"
-    )
+    logo_path = Path(__file__).resolve().parent.parent / "assets" / "school_logo.jpeg"
     logo = ""
     if logo_path.exists():
-        logo = RLImage(str(logo_path), width=2.6 * cm, height=2.6 * cm,
-                       kind="proportional")
+        logo = RLImage(str(logo_path), width=2.6 * cm, height=2.6 * cm, kind="proportional")
 
     school_details = [
-        Paragraph("GOVERNMENT GIRLS DAY SECONDARY SCHOOL T/Wada", school_title),
-        Paragraph("Tudun Wada, Birnin Kebbi, Kebbi State, Nigeria",
-                  school_address),
+        Paragraph("GOVERNMENT GIRLS DAY SECONDARY SCHOOL", school_title),
+        Paragraph("Tudun Wada, Birnin Kebbi, Kebbi State, Nigeria", school_address),
         Spacer(1, 3),
-        Paragraph("Educating the Girl Child for a Brighter Future",
-                  motto_style),
+        Paragraph("Educating the Girl Child for a Brighter Future", motto_style),
     ]
     header = Table([[logo, school_details]], colWidths=[3.2 * cm, 14.8 * cm])
     header.setStyle(TableStyle([
@@ -467,7 +307,7 @@ def _render_card_pdf(data: dict):
     # ---------------- student info ----------------
     student = data["student"]
     date_label = safe(_resolve_date())
-    class_label = safe(_class_with_arm())      # e.g. JSS1A
+    class_label = safe(_class_label())      # e.g. "JSS1A"
 
     def info_cell(label, value):
         return Paragraph(
@@ -479,8 +319,7 @@ def _render_card_pdf(data: dict):
     info_rows = [
         [
             info_cell("STUDENT NAME", f"<b>{safe(student.get('full_name'))}</b>"),
-            info_cell("ACADEMIC SESSION",
-                      f"<b>{safe(data.get('session_name'))}</b>"),
+            info_cell("ACADEMIC SESSION", f"<b>{safe(data.get('session_name'))}</b>"),
         ],
         [
             info_cell("ADMISSION NUMBER", safe(student.get("admission_no"))),
@@ -506,8 +345,7 @@ def _render_card_pdf(data: dict):
     story += [info_table, Spacer(1, 0.4 * cm)]
 
     # ---------------- marks table ----------------
-    headers = ["SUBJECT", "ASSIGN. (10)", "1ST CA (10)", "2ND CA (10)",
-               "EXAM  (70)", "TOTAL (100)", "GRADE", "REMARK"]
+    headers = ["SUBJECT", "ASSIGN. (10)", "1ST CA (10)", "2ND CA (10)", "EXAM  (70)", "TOTAL (100)", "GRADE", "REMARK"]
     rows = [[Paragraph(h, table_header) for h in headers]]
     for s in data.get("subjects", []):
         rows.append([
@@ -523,8 +361,7 @@ def _render_card_pdf(data: dict):
 
     marks_table = Table(
         rows,
-        colWidths=[4.2 * cm, 1.7 * cm, 1.6 * cm, 1.6 * cm,
-                   1.7 * cm, 1.7 * cm, 1.6 * cm, 1.9 * cm],
+        colWidths=[4.2 * cm, 1.7 * cm, 1.6 * cm, 1.6 * cm, 1.7 * cm, 1.7 * cm, 1.6 * cm, 1.9 * cm],
         repeatRows=1,
         hAlign="CENTER",
     )
@@ -549,7 +386,8 @@ def _render_card_pdf(data: dict):
     summary_items = [
         ("TOTAL SCORE", summary.get("total_score", "—")),
         ("AVERAGE",     summary.get("average", "—")),
-        ("POSITION",    summary.get("position") or "—"),
+        # ("POSITION",    summary.get("position") or "—"),
+        ("CLASS SIZE",  summary.get("class_size") or "—"),
         ("PASSED",      summary.get("passed", 0)),
         ("FAILED",      summary.get("failed", 0)),
     ]
@@ -566,7 +404,7 @@ def _render_card_pdf(data: dict):
         )
         for i, (label, value) in enumerate(summary_items)
     ]
-    summary_table = Table([summary_cells], colWidths=[3.6 * cm] * 5)
+    summary_table = Table([summary_cells], colWidths=[3.0 * cm] * 6)
     summary_table.setStyle(TableStyle([
         ("BACKGROUND", (0, 0), (-1, -1), SAGE_TINT),
         ("INNERGRID",  (0, 0), (-1, -1), 0.4, LINE),
@@ -579,44 +417,21 @@ def _render_card_pdf(data: dict):
 
     # ---------------- remarks ----------------
     average_value = summary.get("average")
-    teacher_remark = data.get(
-        "teacher_remark",
-        summary.get("teacher_remark")
-        or _auto_remark(average_value, "teacher"),
-    )
-    principal_remark = data.get(
-        "principal_remark",
-        summary.get("principal_remark")
-        or _auto_remark(average_value, "principal"),
-    )
+    teacher_remark = data.get("teacher_remark", summary.get("teacher_remark") or _auto_remark(average_value, "teacher"))
+    principal_remark = data.get("principal_remark", summary.get("principal_remark") or _auto_remark(average_value, "principal"))
 
     def remark_panel(title, text, bg, border, spine):
         content = [
             Paragraph(title, section_style),
             Spacer(1, 5),
-            Paragraph(
-                safe(text) if text else "______________________________",
-                remark_text,
-            ),
+            Paragraph(safe(text) if text else "______________________________", remark_text),
         ]
-        return panel(
-            content,
-            width=8.7, bg=bg, border=border, spine=spine,
-            pad_top=10, pad_bottom=14, pad_lr=10,
-        )
+        return panel(content, width=8.7, bg=bg, border=border, spine=spine, pad_top=10, pad_bottom=14, pad_lr=10)
 
-    teacher_panel = remark_panel(
-        "CLASS TEACHER'S REMARKS", teacher_remark,
-        bg=GOLD_PALE, border=GOLD, spine=GOLD,
-    )
-    principal_panel = remark_panel(
-        "PRINCIPAL'S REMARKS", principal_remark,
-        bg=SAGE_TINT, border=SAGE, spine=SAGE_DEEP,
-    )
-    remarks_row = Table(
-        [[teacher_panel, "", principal_panel]],
-        colWidths=[8.7 * cm, 0.6 * cm, 8.7 * cm],
-    )
+    teacher_panel = remark_panel("CLASS TEACHER'S REMARKS", teacher_remark, bg=GOLD_PALE, border=GOLD, spine=GOLD)
+    principal_panel = remark_panel("PRINCIPAL'S REMARKS", principal_remark, bg=SAGE_TINT, border=SAGE, spine=SAGE_DEEP)
+    
+    remarks_row = Table([[teacher_panel, "", principal_panel]], colWidths=[8.7 * cm, 0.6 * cm, 8.7 * cm])
     remarks_row.setStyle(TableStyle([
         ("VALIGN", (0, 0), (-1, -1), "TOP"),
         ("LEFTPADDING",  (0, 0), (-1, -1), 0),
@@ -629,14 +444,8 @@ def _render_card_pdf(data: dict):
     # ---------------- signatures ----------------
     signatures = Table(
         [[
-            Paragraph(
-                "____________________________<br/>"
-                "CLASS TEACHER'S SIGNATURE", signature,
-            ),
-            Paragraph(
-                "____________________________<br/>"
-                "PRINCIPAL'S SIGNATURE / STAMP", signature,
-            ),
+            Paragraph("____________________________<br/>CLASS TEACHER'S SIGNATURE", signature),
+            Paragraph("____________________________<br/>PRINCIPAL'S SIGNATURE / STAMP", signature),
         ]],
         colWidths=[9 * cm, 9 * cm],
     )
@@ -650,8 +459,7 @@ def _render_card_pdf(data: dict):
 
     # ---------------- footer ----------------
     footer = Table(
-        [[Paragraph("DISCIPLINE   ·   HARD WORK   ·   EXCELLENCE",
-                    footer_style)]],
+        [[Paragraph("DISCIPLINE   ·   HARD WORK   ·   EXCELLENCE", footer_style)]],
         colWidths=[18 * cm],
     )
     footer.setStyle(TableStyle([
@@ -671,6 +479,9 @@ def _stream_pdf(buf, filename):
         content=buf.getvalue(),
         media_type="application/pdf",
         headers={
-            "Content-Disposition": f'attachment; filename="{filename}"'
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+            "Pragma": "no-cache",
+            "Expires": "0"
         },
     )
